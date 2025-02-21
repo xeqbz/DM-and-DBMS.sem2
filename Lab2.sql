@@ -1,0 +1,193 @@
+--- Task1 ---
+CREATE TABLE GROUPS (
+    ID NUMBER PRIMARY KEY,
+    NAME VARCHAR2(100),
+    C_VAL NUMBER
+);
+
+CREATE TABLE STUDENTS (
+    ID NUMBER PRIMARY KEY,
+    NAME VARCHAR2(100),
+    GROUP_ID NUMBER,
+    CONSTRAINT fk_group
+        FOREIGN KEY (GROUP_ID)
+        REFERENCES GROUPS(ID)
+);
+
+--- Task2 ---
+CREATE SEQUENCE students_seq
+    START WITH 1
+    INCREMENT BY 1
+    NOCACHE;
+
+CREATE SEQUENCE groups_seq
+    START WITH 1
+    INCREMENT BY 1
+    NOCACHE;
+
+CREATE OR REPLACE TRIGGER students_trg
+BEFORE INSERT ON STUDENTS
+FOR EACH ROW
+BEGIN
+    IF :NEW.ID IS NULL THEN
+        :NEW.ID := students_seq.NEXTVAL;
+    END IF;
+END;
+/
+
+CREATE OR REPLACE TRIGGER groups_trg
+BEFORE INSERT ON GROUPS
+FOR EACH ROW
+BEGIN
+    IF :NEW.ID IS NULL THEN
+        :NEW.ID := groups_seq.NEXTVAL;
+    END IF;
+END;
+/
+
+CREATE UNIQUE INDEX idx_groups_name ON GROUPS(NAME);
+
+CREATE OR REPLACE TRIGGER groups_name_unique_trg
+BEFORE INSERT OR UPDATE ON GROUPS
+FOR EACH ROW
+DECLARE
+    v_count NUMBER;
+BEGIN
+    SELECT COUNT(*)
+    INTO v_count
+    FROM GROUPS
+    WHERE NAME = :NEW.NAME
+    AND ID != NVL(:NEW.ID, -1);
+
+    IF v_count > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Название группы уже существует');
+    END IF;
+END;
+/
+
+--- Task 3 ---
+ALTER TABLE STUDENTS DROP CONSTRAINT fk_group;
+
+CREATE OR REPLACE TRIGGER groups_cascade_delete_trg
+BEFORE DELETE ON GROUPS
+FOR EACH ROW
+BEGIN
+    DELETE FROM STUDENTS
+    WHERE GROUP_ID = :OLD.ID;
+END;
+/
+
+--- Task4 ---
+CREATE TABLE STUDENTS_LOG (
+    LOG_ID NUMBER PRIMARY KEY,
+    OPERATION VARCHAR2(10),
+    STUDENT_ID NUMBER,
+    OLD_NAME VARCHAR2(100),
+    NEW_NAME VARCHAR2(100),
+    OLD_GROUP_ID NUMBER,
+    NEW_GROUP_ID NUMBER,
+    LOG_DATE DATE DEFAULT SYSDATE
+);
+
+CREATE SEQUENCE students_log_seq
+    START WITH 1
+    INCREMENT BY 1
+    NOCACHE;
+
+CREATE OR REPLACE TRIGGER students_audit_trg
+AFTER INSERT OR UPDATE OR DELETE ON STUDENTS
+FOR EACH ROW
+BEGIN
+    IF INSERTING THEN
+        INSERT INTO STUDENTS_LOG (LOG_ID, OPERATION, STUDENT_ID, NEW_NAME, NEW_GROUP_ID)
+        VALUES (students_log_seq.NEXTVAL, 'INSERT', :NEW.ID, :NEW.NAME, :NEW.GROUP_ID);
+
+    ELSIF UPDATING THEN
+        INSERT INTO STUDENTS_LOG (
+            LOG_ID, OPERATION, STUDENT_ID,
+            OLD_NAME, NEW_NAME,
+            OLD_GROUP_ID, NEW_GROUP_ID
+        )
+        VALUES (
+            students_log_seq.NEXTVAL, 'UPDATE', :NEW.ID,
+            :OLD.NAME, :NEW.NAME,
+            :OLD.GROUP_ID, :NEW.GROUP_ID
+        );
+
+    ELSIF DELETING THEN
+        INSERT INTO STUDENTS_LOG (LOG_ID, OPERATION, STUDENT_ID, OLD_NAME, OLD_GROUP_ID)
+        VALUES (students_log_seq.NEXTVAL, 'DELETE', :OLD.ID, :OLD.NAME, :OLD.GROUP_ID);
+    END IF;
+END;
+/
+
+--- Task 5 ---
+CREATE GLOBAL TEMPORARY TABLE STUDENTS_RESTORE (
+    ID NUMBER,
+    NAME VARCHAR2(100),
+    GROUP_ID NUMBER
+) ON COMMIT DELETE ROWS;
+
+CREATE OR REPLACE PROCEDURE restore_students_state (
+    p_restore_time IN DATE,
+    p_time_offset IN NUMBER DEFAULT 0
+) AS
+    v_effective_time DATE;
+BEGIN
+    v_effective_time := p_restore_time + (p_time_offset / 24);
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE STUDENTS_RESTORE';
+
+    INSERT INTO STUDENTS_RESTORE (ID, NAME, GROUP_ID)
+    SELECT
+        s.ID,
+        s.NAME,
+        s.GROUP_ID
+    FROM (
+        SELECT
+            STUDENT_ID AS ID,
+            CASE
+                WHEN OPERATION = 'DELETE' THEN NULL
+                ELSE NVL(NEW_NAME, OLD_NAME)
+            END AS NAME,
+            CASE
+                WHEN OPERATION = 'DELETE' THEN NULL
+                ELSE NVL(NEW_GROUP_ID, OLD_GROUP_ID)
+            END AS GROUP_ID,
+            ROW_NUMBER() OVER (PARTITION BY STUDENT_ID ORDER BY LOG_DATE DESC) AS rn
+        FROM STUDENTS_LOG
+        WHERE LOG_DATE <= v_effective_time
+    ) s
+    WHERE s.rn = 1
+    AND s.NAME IS NOT NULL;
+
+    DBMS_OUTPUT.PUT_LINE('Данные восстановлены на ' || TO_CHAR(v_effective_time, 'YYYY-MM-DD HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Количество записей: ' || SQL%ROWCOUNT);
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('Ошибка: ' || SQLERRM);
+        RAISE;
+END restore_students_state;
+/
+
+--- Task 6 ---
+CREATE OR REPLACE TRIGGER students_update_groups_c_val
+AFTER INSERT OR UPDATE OR DELETE ON STUDENTS
+FOR EACH ROW
+BEGIN
+    IF UPDATING OR DELETING THEN
+        UPDATE GROUPS
+        SET C_VAL = (SELECT COUNT(*)
+                     FROM STUDENTS
+                     WHERE GROUP_ID = :OLD.GROUP_ID)
+        WHERE ID = :OLD.GROUP_ID;
+    END IF;
+
+    IF INSERTING OR UPDATING THEN
+        UPDATE GROUPS
+        SET C_VAL = (SELECT COUNT(*)
+                     FROM STUDENTS
+                     WHERE GROUP_ID = :NEW.GROUP_ID)
+        WHERE ID = :NEW.GROUP_ID;
+    END IF;
+END;
+/
