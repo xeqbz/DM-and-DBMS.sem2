@@ -14,7 +14,7 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
     v_count NUMBER;
     v_cycle_detected BOOLEAN := FALSE;
     v_dependencies dep_tab := dep_tab();
-    v_ddl CLOB; -- Используем CLOB для больших DDL
+    v_ddl CLOB;
 
     CURSOR object_diff_to_prod IS
         SELECT 'TABLE' as object_type, t.table_name as object_name
@@ -72,7 +72,6 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
         AND o2.object_type = 'PROCEDURE';
 
 BEGIN
-    -- Проверка существования схем
     SELECT COUNT(*)
     INTO v_count
     FROM all_users
@@ -91,7 +90,6 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20002, 'Промышленная схема ' || prod_schema_name || ' не существует');
     END IF;
 
-    -- Сбор зависимостей для таблиц
     SELECT dep_rec(table_name, referenced_table_name)
     BULK COLLECT INTO v_dependencies
     FROM (
@@ -112,10 +110,8 @@ BEGIN
     FOR rec IN object_diff_to_prod LOOP
         v_ddl := NULL;
         IF rec.object_type = 'TABLE' THEN
-            -- Начало DDL для таблицы
             v_ddl := 'CREATE TABLE "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '" (' || chr(10);
 
-            -- Колонки
             FOR col IN (
                 SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
                 FROM all_tab_columns
@@ -135,7 +131,6 @@ BEGIN
                 v_ddl := v_ddl || ',' || chr(10);
             END LOOP;
 
-            -- Ограничения
             FOR cons IN (
                 SELECT constraint_name, constraint_type, r_owner, r_constraint_name
                 FROM all_constraints
@@ -190,10 +185,8 @@ BEGIN
                 v_ddl := v_ddl || ',' || chr(10);
             END LOOP;
 
-            -- Удаляем последнюю запятую и закрываем скобку
             v_ddl := RTRIM(v_ddl, ',' || chr(10)) || chr(10) || ')';
 
-            -- Проверка циклических зависимостей
             FOR dep IN (
                 WITH deps (table_name, depends_on, path) AS (
                     SELECT table_name, depends_on, ',' || table_name || ','
@@ -218,7 +211,6 @@ BEGIN
             END IF;
 
         ELSIF rec.object_type = 'PROCEDURE' THEN
-            -- Генерация DDL для процедуры
             v_ddl := 'CREATE OR REPLACE PROCEDURE "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '" AS' || chr(10);
             FOR src IN (
                 SELECT text
