@@ -14,10 +14,9 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
     v_count NUMBER;
     v_cycle_detected BOOLEAN := FALSE;
     v_dependencies dep_tab := dep_tab();
+    v_ddl CLOB; -- Используем CLOB для больших DDL
 
-    -- Курсор для сравнения объектов (таблицы, процедуры, функции, пакеты, индексы)
-    CURSOR object_diff IS
-        -- Таблицы
+    CURSOR object_diff_to_prod IS
         SELECT 'TABLE' as object_type, t.table_name as object_name
         FROM all_tables t
         WHERE t.owner = UPPER(dev_schema_name)
@@ -26,7 +25,6 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
         FROM all_tables t2
         WHERE t2.owner = UPPER(prod_schema_name)
         UNION
-        -- Таблицы с различающейся структурой
         SELECT 'TABLE', tc1.table_name
         FROM (
             SELECT table_name,
@@ -43,7 +41,6 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
             WHERE owner = UPPER(prod_schema_name)
             GROUP BY table_name
         ) tc1
-        -- Процедуры
         UNION
         SELECT 'PROCEDURE', o1.object_name
         FROM all_objects o1
@@ -53,60 +50,26 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
         SELECT 'PROCEDURE', o2.object_name
         FROM all_objects o2
         WHERE o2.owner = UPPER(prod_schema_name)
-        AND o2.object_type = 'PROCEDURE'
-        -- Функции
-        UNION
-        SELECT 'FUNCTION', o3.object_name
-        FROM all_objects o3
-        WHERE o3.owner = UPPER(dev_schema_name)
-        AND o3.object_type = 'FUNCTION'
+        AND o2.object_type = 'PROCEDURE';
+
+    CURSOR object_diff_to_drop IS
+        SELECT 'TABLE' as object_type, t.table_name as object_name
+        FROM all_tables t
+        WHERE t.owner = UPPER(prod_schema_name)
         MINUS
-        SELECT 'FUNCTION', o4.object_name
-        FROM all_objects o4
-        WHERE o4.owner = UPPER(prod_schema_name)
-        AND o4.object_type = 'FUNCTION'
-        -- Пакеты
+        SELECT 'TABLE', t2.table_name
+        FROM all_tables t2
+        WHERE t2.owner = UPPER(dev_schema_name)
         UNION
-        SELECT 'PACKAGE', o5.object_name
-        FROM all_objects o5
-        WHERE o5.owner = UPPER(dev_schema_name)
-        AND o5.object_type = 'PACKAGE'
+        SELECT 'PROCEDURE', o1.object_name
+        FROM all_objects o1
+        WHERE o1.owner = UPPER(prod_schema_name)
+        AND o1.object_type = 'PROCEDURE'
         MINUS
-        SELECT 'PACKAGE', o6.object_name
-        FROM all_objects o6
-        WHERE o6.owner = UPPER(prod_schema_name)
-        AND o6.object_type = 'PACKAGE'
-        -- Индексы
-        UNION
-        SELECT 'INDEX', i1.index_name
-        FROM all_indexes i1
-        WHERE i1.owner = UPPER(dev_schema_name)
-        MINUS
-        SELECT 'INDEX', i2.index_name
-        FROM all_indexes i2
-        WHERE i2.owner = UPPER(prod_schema_name)
-        UNION
-        -- Индексы с различающейся структурой
-        SELECT 'INDEX', ic1.index_name
-        FROM (
-            SELECT i.index_name,
-                   i.table_name,
-                   i.uniqueness,
-                   LISTAGG(ic.column_name, ',') WITHIN GROUP (ORDER BY ic.column_position) as columns
-            FROM all_ind_columns ic
-            JOIN all_indexes i ON ic.index_name = i.index_name AND ic.index_owner = i.owner
-            WHERE i.owner = UPPER(dev_schema_name)
-            GROUP BY i.index_name, i.table_name, i.uniqueness
-            MINUS
-            SELECT i.index_name,
-                   i.table_name,
-                   i.uniqueness,
-                   LISTAGG(ic.column_name, ',') WITHIN GROUP (ORDER BY ic.column_position) as columns
-            FROM all_ind_columns ic
-            JOIN all_indexes i ON ic.index_name = i.index_name AND ic.index_owner = i.owner
-            WHERE i.owner = UPPER(prod_schema_name)
-            GROUP BY i.index_name, i.table_name, i.uniqueness
-        ) ic1;
+        SELECT 'PROCEDURE', o2.object_name
+        FROM all_objects o2
+        WHERE o2.owner = UPPER(dev_schema_name)
+        AND o2.object_type = 'PROCEDURE';
 
 BEGIN
     -- Проверка существования схем
@@ -128,7 +91,7 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20002, 'Промышленная схема ' || prod_schema_name || ' не существует');
     END IF;
 
-    -- Сбор зависимостей только для таблиц
+    -- Сбор зависимостей для таблиц
     SELECT dep_rec(table_name, referenced_table_name)
     BULK COLLECT INTO v_dependencies
     FROM (
@@ -143,53 +106,157 @@ BEGIN
         AND ac2.owner = UPPER(dev_schema_name)
     );
 
-    DBMS_OUTPUT.PUT_LINE('Объекты для создания/обновления в ' || prod_schema_name || ':');
+    DBMS_OUTPUT.PUT_LINE('DDL-скрипты для создания/обновления объектов в ' || prod_schema_name || ':');
     DBMS_OUTPUT.PUT_LINE('----------------------------------------');
 
-    FOR rec IN object_diff LOOP
-        DECLARE
-            v_object_type VARCHAR2(30) := rec.object_type;
-            v_object_name VARCHAR2(128) := rec.object_name;
-            v_cycle_found BOOLEAN := FALSE;
-        BEGIN
-            -- Проверка циклических зависимостей только для таблиц
-            IF v_object_type = 'TABLE' THEN
-                FOR dep IN (
-                    WITH deps (table_name, depends_on, path) AS (
-                        SELECT table_name, depends_on, ',' || table_name || ','
-                        FROM TABLE(v_dependencies)
-                        WHERE table_name = v_object_name
-                        UNION ALL
-                        SELECT d.table_name, d.depends_on, dd.path || d.table_name || ','
-                        FROM TABLE(v_dependencies) d
-                        JOIN deps dd ON d.table_name = dd.depends_on
-                    ) CYCLE table_name SET is_cycle TO 'Y' DEFAULT 'N'
-                    SELECT table_name, path
-                    FROM deps
-                    WHERE is_cycle = 'Y'
-                    AND ',' || path || ',' LIKE '%,' || v_object_name || ',%' || v_object_name || ',%'
-                ) LOOP
-                    v_cycle_found := TRUE;
-                    v_cycle_detected := TRUE;
-                    EXIT;
-                END LOOP;
+    FOR rec IN object_diff_to_prod LOOP
+        v_ddl := NULL;
+        IF rec.object_type = 'TABLE' THEN
+            -- Начало DDL для таблицы
+            v_ddl := 'CREATE TABLE "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '" (' || chr(10);
+
+            -- Колонки
+            FOR col IN (
+                SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
+                FROM all_tab_columns
+                WHERE owner = UPPER(dev_schema_name)
+                AND table_name = rec.object_name
+                ORDER BY column_id
+            ) LOOP
+                v_ddl := v_ddl || '    "' || col.column_name || '" ' || col.data_type;
+                IF col.data_type IN ('VARCHAR2', 'CHAR') THEN
+                    v_ddl := v_ddl || '(' || col.data_length || ')';
+                ELSIF col.data_type = 'NUMBER' AND col.data_precision IS NOT NULL THEN
+                    v_ddl := v_ddl || '(' || col.data_precision || ',' || NVL(col.data_scale, 0) || ')';
+                END IF;
+                IF col.nullable = 'N' THEN
+                    v_ddl := v_ddl || ' NOT NULL';
+                END IF;
+                v_ddl := v_ddl || ',' || chr(10);
+            END LOOP;
+
+            -- Ограничения
+            FOR cons IN (
+                SELECT constraint_name, constraint_type, r_owner, r_constraint_name
+                FROM all_constraints
+                WHERE owner = UPPER(dev_schema_name)
+                AND table_name = rec.object_name
+                AND constraint_type IN ('P', 'R')
+            ) LOOP
+                v_ddl := v_ddl || '    CONSTRAINT "' || cons.constraint_name || '" ';
+                IF cons.constraint_type = 'P' THEN
+                    v_ddl := v_ddl || 'PRIMARY KEY (';
+                    FOR col IN (
+                        SELECT column_name
+                        FROM all_cons_columns
+                        WHERE owner = UPPER(dev_schema_name)
+                        AND constraint_name = cons.constraint_name
+                        ORDER BY position
+                    ) LOOP
+                        v_ddl := v_ddl || '"' || col.column_name || '",';
+                    END LOOP;
+                    v_ddl := RTRIM(v_ddl, ',') || ')';
+                ELSIF cons.constraint_type = 'R' THEN
+                    v_ddl := v_ddl || 'FOREIGN KEY (';
+                    FOR col IN (
+                        SELECT column_name
+                        FROM all_cons_columns
+                        WHERE owner = UPPER(dev_schema_name)
+                        AND constraint_name = cons.constraint_name
+                        ORDER BY position
+                    ) LOOP
+                        v_ddl := v_ddl || '"' || col.column_name || '",';
+                    END LOOP;
+                    v_ddl := RTRIM(v_ddl, ',') || ') REFERENCES "' || cons.r_owner || '"."';
+                    FOR r_table IN (
+                        SELECT table_name
+                        FROM all_constraints
+                        WHERE owner = cons.r_owner
+                        AND constraint_name = cons.r_constraint_name
+                    ) LOOP
+                        v_ddl := v_ddl || r_table.table_name || '" (';
+                    END LOOP;
+                    FOR col IN (
+                        SELECT column_name
+                        FROM all_cons_columns
+                        WHERE owner = cons.r_owner
+                        AND constraint_name = cons.r_constraint_name
+                        ORDER BY position
+                    ) LOOP
+                        v_ddl := v_ddl || '"' || col.column_name || '",';
+                    END LOOP;
+                    v_ddl := RTRIM(v_ddl, ',') || ')';
+                END IF;
+                v_ddl := v_ddl || ',' || chr(10);
+            END LOOP;
+
+            -- Удаляем последнюю запятую и закрываем скобку
+            v_ddl := RTRIM(v_ddl, ',' || chr(10)) || chr(10) || ')';
+
+            -- Проверка циклических зависимостей
+            FOR dep IN (
+                WITH deps (table_name, depends_on, path) AS (
+                    SELECT table_name, depends_on, ',' || table_name || ','
+                    FROM TABLE(v_dependencies)
+                    WHERE table_name = rec.object_name
+                    UNION ALL
+                    SELECT d.table_name, d.depends_on, dd.path || d.table_name || ','
+                    FROM TABLE(v_dependencies) d
+                    JOIN deps dd ON d.table_name = dd.depends_on
+                ) CYCLE table_name SET is_cycle TO 'Y' DEFAULT 'N'
+                SELECT table_name, path
+                FROM deps
+                WHERE is_cycle = 'Y'
+                AND ',' || path || ',' LIKE '%,' || rec.object_name || ',%' || rec.object_name || ',%'
+            ) LOOP
+                v_cycle_detected := TRUE;
+                DBMS_OUTPUT.PUT_LINE('-- TABLE: ' || rec.object_name || ' (циклическая зависимость)');
+                EXIT;
+            END LOOP;
+            IF NOT v_cycle_detected THEN
+                DBMS_OUTPUT.PUT_LINE('-- TABLE: ' || rec.object_name);
             END IF;
 
-            IF v_cycle_found THEN
-                DBMS_OUTPUT.PUT_LINE(v_object_type || ': ' || v_object_name || ' (обнаружено закольцованное ограничение)');
-            ELSE
-                DBMS_OUTPUT.PUT_LINE(v_object_type || ': ' || v_object_name);
+        ELSIF rec.object_type = 'PROCEDURE' THEN
+            -- Генерация DDL для процедуры
+            v_ddl := 'CREATE OR REPLACE PROCEDURE "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '" AS' || chr(10);
+            FOR src IN (
+                SELECT text
+                FROM all_source
+                WHERE owner = UPPER(dev_schema_name)
+                AND name = rec.object_name
+                AND type = 'PROCEDURE'
+                ORDER BY line
+            ) LOOP
+                IF src.text IS NOT NULL THEN
+                    v_ddl := v_ddl || src.text;
+                END IF;
+            END LOOP;
+            IF SUBSTR(TRIM(v_ddl), -1) != ';' THEN
+                v_ddl := TRIM(v_ddl) || ';';
             END IF;
-        END;
+            DBMS_OUTPUT.PUT_LINE('-- PROCEDURE: ' || rec.object_name);
+        END IF;
+
+        DBMS_OUTPUT.PUT_LINE(v_ddl);
+        DBMS_OUTPUT.PUT_LINE('');
     END LOOP;
 
     IF v_cycle_detected THEN
         DBMS_OUTPUT.PUT_LINE('----------------------------------------');
-        DBMS_OUTPUT.PUT_LINE('Внимание: Обнаружены циклические зависимости в таблицах. Необходима ручная обработка.');
+        DBMS_OUTPUT.PUT_LINE('Внимание: Обнаружены циклические зависимости в таблицах.');
     END IF;
+
+    DBMS_OUTPUT.PUT_LINE('DDL-скрипты для удаления объектов из ' || prod_schema_name || ':');
+    DBMS_OUTPUT.PUT_LINE('----------------------------------------');
+
+    FOR rec IN object_diff_to_drop LOOP
+        DBMS_OUTPUT.PUT_LINE('DROP ' || rec.object_type || ' "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '";');
+    END LOOP;
 
 EXCEPTION
     WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('Ошибка: ' || SQLERRM);
         RAISE_APPLICATION_ERROR(-20003, 'Ошибка выполнения: ' || SQLERRM);
 END compare_schemas;
 /
@@ -197,8 +264,3 @@ END compare_schemas;
 BEGIN
     compare_schemas('C##DEV', 'C##PROD');
 END;
-
-
-
-
-
