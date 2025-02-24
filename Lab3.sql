@@ -6,15 +6,23 @@ CREATE OR REPLACE TYPE dep_rec AS OBJECT (
 
 CREATE OR REPLACE TYPE dep_tab AS TABLE OF dep_rec;
 /
-
 CREATE OR REPLACE PROCEDURE compare_schemas (
     dev_schema_name IN VARCHAR2,
     prod_schema_name IN VARCHAR2
 ) AS
     v_count NUMBER;
     v_cycle_detected BOOLEAN := FALSE;
-    v_dependencies dep_tab := dep_tab();
     v_ddl CLOB;
+    v_dependencies dep_tab := dep_tab();
+
+    -- Тип для хранения отсортированных объектов
+    TYPE table_rec IS RECORD (
+        object_type VARCHAR2(30),
+        object_name VARCHAR2(128),
+        has_cycle BOOLEAN
+    );
+    TYPE table_tab IS TABLE OF table_rec;
+    v_sorted_tables table_tab := table_tab();
 
     CURSOR object_diff_to_prod IS
         SELECT 'TABLE' as object_type, t.table_name as object_name
@@ -71,7 +79,73 @@ CREATE OR REPLACE PROCEDURE compare_schemas (
         WHERE o2.owner = UPPER(dev_schema_name)
         AND o2.object_type = 'PROCEDURE';
 
+    -- Функция для топологической сортировки
+    PROCEDURE topological_sort IS
+        TYPE visited_tab IS TABLE OF BOOLEAN INDEX BY VARCHAR2(128);
+        v_visited visited_tab;
+        v_temp_mark visited_tab;
+        v_tables table_tab := table_tab();
+
+        PROCEDURE visit(p_table_name IN VARCHAR2, p_depth IN NUMBER) IS
+            v_rec table_rec;
+            v_has_cycle BOOLEAN := FALSE;
+            v_dep_table_name VARCHAR2(128);
+            v_dep_depends_on VARCHAR2(128);
+        BEGIN
+            IF v_temp_mark.EXISTS(p_table_name) THEN
+                v_cycle_detected := TRUE;
+                v_has_cycle := TRUE;
+                RETURN;
+            END IF;
+
+            IF NOT v_visited.EXISTS(p_table_name) THEN
+                v_temp_mark(p_table_name) := TRUE;
+
+                FOR i IN 1..v_dependencies.COUNT LOOP
+                    v_dep_table_name := v_dependencies(i).table_name;
+                    v_dep_depends_on := v_dependencies(i).depends_on;
+                    IF v_dep_table_name = p_table_name THEN
+                        visit(v_dep_depends_on, p_depth + 1);
+                    END IF;
+                END LOOP;
+
+                v_visited(p_table_name) := TRUE;
+                v_temp_mark.DELETE(p_table_name);
+
+                v_rec.object_type := 'TABLE';
+                v_rec.object_name := p_table_name;
+                v_rec.has_cycle := v_has_cycle;
+                v_tables.EXTEND;
+                v_tables(v_tables.LAST) := v_rec;
+            END IF;
+        END visit;
+    BEGIN
+        -- Собираем все таблицы из object_diff_to_prod
+        FOR rec IN object_diff_to_prod LOOP
+            IF rec.object_type = 'TABLE' AND NOT v_visited.EXISTS(rec.object_name) THEN
+                visit(rec.object_name, 1);
+            END IF;
+        END LOOP;
+
+        -- Копируем отсортированные таблицы
+        v_sorted_tables := v_tables;
+
+        -- Добавляем процедуры (они не имеют зависимостей)
+        FOR rec IN object_diff_to_prod LOOP
+            IF rec.object_type = 'PROCEDURE' THEN
+                v_sorted_tables.EXTEND;
+                v_sorted_tables(v_sorted_tables.LAST).object_type := rec.object_type;
+                v_sorted_tables(v_sorted_tables.LAST).object_name := rec.object_name;
+                v_sorted_tables(v_sorted_tables.LAST).has_cycle := FALSE;
+            END IF;
+        END LOOP;
+    END topological_sort;
+
 BEGIN
+    DBMS_OUTPUT.PUT_LINE('Текущий контейнер: ' || SYS_CONTEXT('USERENV', 'CON_NAME'));
+    DBMS_OUTPUT.PUT_LINE('Текущий пользователь: ' || USER);
+
+    -- Проверка существования схем
     SELECT COUNT(*)
     INTO v_count
     FROM all_users
@@ -90,6 +164,7 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20002, 'Промышленная схема ' || prod_schema_name || ' не существует');
     END IF;
 
+    -- Сбор зависимостей для таблиц
     SELECT dep_rec(table_name, referenced_table_name)
     BULK COLLECT INTO v_dependencies
     FROM (
@@ -104,19 +179,22 @@ BEGIN
         AND ac2.owner = UPPER(dev_schema_name)
     );
 
+    -- Выполняем топологическую сортировку
+    topological_sort;
+
     DBMS_OUTPUT.PUT_LINE('DDL-скрипты для создания/обновления объектов в ' || prod_schema_name || ':');
     DBMS_OUTPUT.PUT_LINE('----------------------------------------');
 
-    FOR rec IN object_diff_to_prod LOOP
+    FOR i IN 1..v_sorted_tables.COUNT LOOP
         v_ddl := NULL;
-        IF rec.object_type = 'TABLE' THEN
-            v_ddl := 'CREATE TABLE "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '" (' || chr(10);
+        IF v_sorted_tables(i).object_type = 'TABLE' THEN
+            v_ddl := 'CREATE TABLE "' || UPPER(prod_schema_name) || '"."' || v_sorted_tables(i).object_name || '" (' || chr(10);
 
             FOR col IN (
                 SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
                 FROM all_tab_columns
                 WHERE owner = UPPER(dev_schema_name)
-                AND table_name = rec.object_name
+                AND table_name = v_sorted_tables(i).object_name
                 ORDER BY column_id
             ) LOOP
                 v_ddl := v_ddl || '    "' || col.column_name || '" ' || col.data_type;
@@ -135,7 +213,7 @@ BEGIN
                 SELECT constraint_name, constraint_type, r_owner, r_constraint_name
                 FROM all_constraints
                 WHERE owner = UPPER(dev_schema_name)
-                AND table_name = rec.object_name
+                AND table_name = v_sorted_tables(i).object_name
                 AND constraint_type IN ('P', 'R')
             ) LOOP
                 v_ddl := v_ddl || '    CONSTRAINT "' || cons.constraint_name || '" ';
@@ -163,14 +241,17 @@ BEGIN
                         v_ddl := v_ddl || '"' || col.column_name || '",';
                     END LOOP;
                     v_ddl := RTRIM(v_ddl, ',') || ') REFERENCES "' || cons.r_owner || '"."';
-                    FOR r_table IN (
+                    DECLARE
+                        v_ref_table VARCHAR2(128);
+                    BEGIN
                         SELECT table_name
+                        INTO v_ref_table
                         FROM all_constraints
                         WHERE owner = cons.r_owner
                         AND constraint_name = cons.r_constraint_name
-                    ) LOOP
-                        v_ddl := v_ddl || r_table.table_name || '" (';
-                    END LOOP;
+                        AND ROWNUM = 1;
+                        v_ddl := v_ddl || v_ref_table || '" (';
+                    END;
                     FOR col IN (
                         SELECT column_name
                         FROM all_cons_columns
@@ -187,36 +268,19 @@ BEGIN
 
             v_ddl := RTRIM(v_ddl, ',' || chr(10)) || chr(10) || ')';
 
-            FOR dep IN (
-                WITH deps (table_name, depends_on, path) AS (
-                    SELECT table_name, depends_on, ',' || table_name || ','
-                    FROM TABLE(v_dependencies)
-                    WHERE table_name = rec.object_name
-                    UNION ALL
-                    SELECT d.table_name, d.depends_on, dd.path || d.table_name || ','
-                    FROM TABLE(v_dependencies) d
-                    JOIN deps dd ON d.table_name = dd.depends_on
-                ) CYCLE table_name SET is_cycle TO 'Y' DEFAULT 'N'
-                SELECT table_name, path
-                FROM deps
-                WHERE is_cycle = 'Y'
-                AND ',' || path || ',' LIKE '%,' || rec.object_name || ',%' || rec.object_name || ',%'
-            ) LOOP
-                v_cycle_detected := TRUE;
-                DBMS_OUTPUT.PUT_LINE('-- TABLE: ' || rec.object_name || ' (циклическая зависимость)');
-                EXIT;
-            END LOOP;
-            IF NOT v_cycle_detected THEN
-                DBMS_OUTPUT.PUT_LINE('-- TABLE: ' || rec.object_name);
+            IF v_sorted_tables(i).has_cycle THEN
+                DBMS_OUTPUT.PUT_LINE('-- TABLE: ' || v_sorted_tables(i).object_name || ' (циклическая зависимость)');
+            ELSE
+                DBMS_OUTPUT.PUT_LINE('-- TABLE: ' || v_sorted_tables(i).object_name);
             END IF;
 
-        ELSIF rec.object_type = 'PROCEDURE' THEN
-            v_ddl := 'CREATE OR REPLACE PROCEDURE "' || UPPER(prod_schema_name) || '"."' || rec.object_name || '" AS' || chr(10);
+        ELSIF v_sorted_tables(i).object_type = 'PROCEDURE' THEN
+            v_ddl := 'CREATE OR REPLACE PROCEDURE "' || UPPER(prod_schema_name) || '"."' || v_sorted_tables(i).object_name || '" AS' || chr(10);
             FOR src IN (
                 SELECT text
                 FROM all_source
                 WHERE owner = UPPER(dev_schema_name)
-                AND name = rec.object_name
+                AND name = v_sorted_tables(i).object_name
                 AND type = 'PROCEDURE'
                 ORDER BY line
             ) LOOP
@@ -227,7 +291,7 @@ BEGIN
             IF SUBSTR(TRIM(v_ddl), -1) != ';' THEN
                 v_ddl := TRIM(v_ddl) || ';';
             END IF;
-            DBMS_OUTPUT.PUT_LINE('-- PROCEDURE: ' || rec.object_name);
+            DBMS_OUTPUT.PUT_LINE('-- PROCEDURE: ' || v_sorted_tables(i).object_name);
         END IF;
 
         DBMS_OUTPUT.PUT_LINE(v_ddl);
@@ -236,7 +300,7 @@ BEGIN
 
     IF v_cycle_detected THEN
         DBMS_OUTPUT.PUT_LINE('----------------------------------------');
-        DBMS_OUTPUT.PUT_LINE('Внимание: Обнаружены циклические зависимости в таблицах.');
+        DBMS_OUTPUT.PUT_LINE('Внимание: Обнаружены циклические зависимости в таблицах. Таблицы с циклами выведены в конце.');
     END IF;
 
     DBMS_OUTPUT.PUT_LINE('DDL-скрипты для удаления объектов из ' || prod_schema_name || ':');
