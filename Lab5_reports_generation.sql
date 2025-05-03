@@ -5,6 +5,7 @@ CREATE TABLE reports_logs (
     CONSTRAINT pk_reports_logs PRIMARY KEY (report_id)
 );
 /
+DROP TABLE REPORTS_LOGS;
 
 CREATE OR REPLACE PACKAGE report_pkg IS
   PROCEDURE create_report(p_start IN TIMESTAMP);
@@ -76,10 +77,10 @@ CREATE OR REPLACE PACKAGE BODY report_pkg AS
         AND operation_type = 'D'
         AND change_time >= p_start;
 
-    v_report := '<html><head><title>Отчет об изменениях</title></head><body>';
-    v_report := v_report || '<h1>Отчет об изменениях с ' || TO_CHAR(p_start, 'YYYY-MM-DD HH24:MI:SS') || '</h1>';
+    v_report := '<html><head><title>Change report</title></head><body>';
+    v_report := v_report || '<h1>Change report from ' || TO_CHAR(p_start, 'YYYY-MM-DD HH24:MI:SS') || '</h1>';
     v_report := v_report || '<table border="1" cellspacing="0" cellpadding="4">';
-    v_report := v_report || '<tr><th>Таблица</th><th>INSERT</th><th>UPDATE</th><th>DELETE</th></tr>';
+    v_report := v_report || '<tr><th>Table</th><th>INSERT</th><th>UPDATE</th><th>DELETE</th></tr>';
     v_report := v_report || '<tr><td>CUSTOMERS</td><td>' || v_ins_customers || '</td><td>' || v_upd_customers || '</td><td>' || v_del_customers || '</td></tr>';
     v_report := v_report || '<tr><td>ORDERS</td><td>' || v_ins_orders || '</td><td>' || v_upd_orders || '</td><td>' || v_del_orders || '</td></tr>';
     v_report := v_report || '<tr><td>ORDER_ITEMS</td><td>' || v_ins_items || '</td><td>' || v_upd_items || '</td><td>' || v_del_items || '</td></tr>';
