@@ -215,6 +215,8 @@ END;
 
 --------------------------------------------------
 
+
+
 DECLARE
   v_json_input CLOB := '{
     "query_type": "DDL",

@@ -89,6 +89,7 @@ BEGIN
 
     p_message := 'Выполняется SELECT запрос.';
     p_rows    := 0;
+    DBMS_OUTPUT.PUT_LINE(v_query);
     OPEN p_cursor FOR v_query;
 
   ELSIF v_query_type IN ('INSERT', 'UPDATE', 'DELETE') THEN
